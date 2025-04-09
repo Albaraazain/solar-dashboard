@@ -250,28 +250,34 @@ export default function BillsPage() {
   }
 
   const fetchBillData = async () => {
+    console.log('Starting fetchBillData...');
     setIsLoading(true);
     setError(null);
     
     try {
       // Get reference number from localStorage
       const referenceNumber = localStorage.getItem('billReference');
+      console.log('Retrieved reference number from localStorage:', referenceNumber);
       
       if (!referenceNumber) {
         throw new Error('No bill reference found. Please go back to the home page and enter your bill details.');
       }
       
       // Fetch bill data from Supabase
+      console.log('Fetching bill data for reference:', referenceNumber);
       const billRecord = await fetchBillByReference(referenceNumber);
+      console.log('Received bill record:', billRecord);
       
       if (!billRecord) {
         throw new Error('Bill not found. Please try again with a valid reference number.');
       }
       
       setBillRecord(billRecord);
+      console.log('Set bill record to state:', billRecord);
       
       // Get stored bill data from localStorage for additional details
       const storedData = localStorage.getItem('billData');
+      console.log('Retrieved stored data from localStorage:', storedData);
       
       if (storedData) {
         try {
