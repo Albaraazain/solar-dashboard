@@ -81,9 +81,7 @@ export default function BillsPage() {
   }
 
   const [billData, setBillData] = useState<BillData>(defaultBillData);
-  useEffect(() => {
-    console.log('[Bill Data State] Current billData:', billData);
-  }, [billData]);
+  const [isInitialized, setIsInitialized] = useState(false);
   const [maxUsage, setMaxUsage] = useState<number>(0)
   const [selectedBill, setSelectedBill] = useState("March 2025")
   const [isLoading, setIsLoading] = useState(true)
@@ -284,7 +282,19 @@ export default function BillsPage() {
       
       if (storedData) {
         try {
-          const parsedData = JSON.parse(storedData);
+          let parsedData;
+          try {
+            const parsedStoredData = JSON.parse(storedData);
+            // Check both formats - direct data and wrapped in data property
+            parsedData = parsedStoredData.data || parsedStoredData;
+            if (!parsedData.customerName) {
+              throw new Error('Invalid data format');
+            }
+            console.log('[Bill Data] Successfully parsed stored data:', parsedData);
+          } catch (parseError) {
+            console.error('[Bill Data] Error parsing stored data:', parseError);
+            throw new Error('Invalid bill data format. Please try again.');
+          }
           
           // Generate bill items if not available
           const { items, taxRate, taxAmount, totalAmount } = generateBillItems(billRecord);
@@ -388,16 +398,56 @@ export default function BillsPage() {
   }
 
   useEffect(() => {
-    fetchBillData();
-    
-    // Animate bill preview
-    const billPreview = document.querySelector(".bill-preview");
-    if (billPreview) {
-      billPreview.classList.add("opacity-0", "translate-y-4");
-      setTimeout(() => {
-        billPreview.classList.remove("opacity-0", "translate-y-4");
-      }, 100);
+    if (!isInitialized) {
+      console.log('[Initialization] First time loading...');
+      fetchBillData()
+        .then(() => {
+          setIsInitialized(true);
+          console.log('[Initialization] Complete');
+          
+          // Animate bill preview
+          const billPreview = document.querySelector(".bill-preview");
+          if (billPreview) {
+            billPreview.classList.add("opacity-0", "translate-y-4");
+            setTimeout(() => {
+              billPreview.classList.remove("opacity-0", "translate-y-4");
+            }, 100);
+          }
+        })
+        .catch((err) => {
+          console.error('[Initialization] Failed:', err);
+          // Retry initialization if billRecord exists but billData failed to process
+          if (billRecord && !billData.customerName) {
+            console.log('[Initialization] Retrying with existing bill record...');
+            const { items, taxRate, taxAmount, totalAmount } = generateBillItems(billRecord);
+            setBillData({
+              customerName: billRecord.customer_name,
+              amount: billRecord.amount.toString(),
+              unitsConsumed: billRecord.units_consumed.toString(),
+              issueDate: billRecord.issue_date,
+              dueDate: billRecord.due_date,
+              referenceNumber: billRecord.reference_number,
+              address: "123 Sample Street, City",
+              phoneNumber: "03000000000",
+              monthlyUnits: {},
+              items,
+              taxRate,
+              taxAmount,
+              totalAmount,
+              ratePerUnit: Math.round(billRecord.amount / billRecord.units_consumed).toString()
+            });
+          }
+        });
     }
+  }, [isInitialized, billRecord, billData.customerName]);
+
+  // Clean up function to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      setIsInitialized(false);
+      setBillData(defaultBillData);
+      setBillRecord(null);
+    };
   }, []);
 
   if (isLoading) {
