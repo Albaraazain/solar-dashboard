@@ -80,7 +80,10 @@ export default function BillsPage() {
     ratePerUnit: "0"
   }
 
-  const [billData, setBillData] = useState<BillData>(defaultBillData)
+  const [billData, setBillData] = useState<BillData>(defaultBillData);
+  useEffect(() => {
+    console.log('[Bill Data State] Current billData:', billData);
+  }, [billData]);
   const [maxUsage, setMaxUsage] = useState<number>(0)
   const [selectedBill, setSelectedBill] = useState("March 2025")
   const [isLoading, setIsLoading] = useState(true)
