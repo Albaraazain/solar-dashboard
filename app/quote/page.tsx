@@ -1,7 +1,7 @@
 // File: app/quote/page.tsx
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { calculateSystemSize } from '@/utils/supabase';
 import {
   Camera,
@@ -20,10 +20,20 @@ import {
   Wind,
   ThermometerSun,
   Droplets,
+  RotateCcw,
+  AlertCircle,
 } from "lucide-react"
-import Image from "next/image"
 import Link from "next/link"
 import { supabase, fetchBillByReference, createQuote } from "@/utils/supabase"
+import { 
+  fetchPanels, 
+  fetchInverters, 
+  fetchStructureTypes, 
+  fetchBracketCosts, 
+  fetchVariableCosts,
+  fetchAllEquipment,
+  DEFAULT_EQUIPMENT 
+} from "@/utils/database" // Import the new database functions
 
 // Equipment types
 interface Panel {
@@ -64,20 +74,48 @@ interface VariableCost {
 }
 
 export default function SizingPage() {
+  // Reference to track whether the component is mounted
+  const isMounted = useRef(true);
+  // Reference to track current calculation request
+  const calculationRequestIdRef = useRef<string | null>(null);
+  // Reference to track if equipment fetch was attempted
+  const equipmentFetchAttemptedRef = useRef(false);
+  
+  // Basic state
   const [activeTab, setActiveTab] = useState("Sizing")
   const [selectedPanelType, setSelectedPanelType] = useState("")
   const [selectedInverterType, setSelectedInverterType] = useState("")
   const [systemSize, setSystemSize] = useState(7.5) // Default system size
+  const [recommendedSystemSize, setRecommendedSystemSize] = useState<number | null>(null)
   const [panels, setPanels] = useState<Panel[]>([])
   const [inverters, setInverters] = useState<Inverter[]>([])
   const [structureTypes, setStructureTypes] = useState<StructureType[]>([])
   const [bracketCosts, setBracketCosts] = useState<BracketCost[]>([])
   const [variableCosts, setVariableCosts] = useState<VariableCost[]>([])
+  
+  // Quote-related state
   const [quoteTotal, setQuoteTotal] = useState<number | null>(null)
   const [quoteBreakdown, setQuoteBreakdown] = useState<{ [key: string]: number }>({})
+  const [savingQuote, setSavingQuote] = useState(false)
+  const [quoteSaved, setQuoteSaved] = useState(false)
+  
+  // Bill and calculation related state
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [monthlyUsage, setMonthlyUsage] = useState(856)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [monthlyUsage, setMonthlyUsage] = useState<number | null>(null)
+  const [billReference, setBillReference] = useState<string | null>(null)
+  const [billId, setBillId] = useState<string | null>(null)
+  const [isCalculating, setIsCalculating] = useState(false)
+  const [calculationError, setCalculationError] = useState<string | null>(null)
+  const [systemSizing, setSystemSizing] = useState<any>(null)
+  
+  // Control flags
+  const [isManualAdjustment, setIsManualAdjustment] = useState(false)
+  const [isInitialCalculationComplete, setIsInitialCalculationComplete] = useState(false)
+  const [isInitialLoadComplete, setIsInitialLoadComplete] = useState(false)
+  
+  // System detail states
   const [weatherData, setWeatherData] = useState<{
     sunHours: number
     efficiency: number
@@ -97,27 +135,27 @@ export default function SizingPage() {
     efficiency_rating: number
     lifespan_years: number
   } | null>(null)
-  const [billReference, setBillReference] = useState<string | null>(null)
-  const [billId, setBillId] = useState<string | null>(null)
-  const [savingQuote, setSavingQuote] = useState(false)
-  const [quoteSaved, setQuoteSaved] = useState(false)
-  const [isCalculating, setIsCalculating] = useState(false)
-  const [calculationError, setCalculationError] = useState<string | null>(null)
-  const [systemSizing, setSystemSizing] = useState<any>(null)
-  const [isManualAdjustment, setIsManualAdjustment] = useState(false)
 
   // Get the selected panel and inverter data
   const selectedPanel = panels.find((panel) => panel.id === selectedPanelType) || panels[0]
   const selectedInverter = inverters.find((inverter) => inverter.id === selectedInverterType) || inverters[0]
   const selectedStructureType = structureTypes[0] // Default to first structure type
 
+  // Calculate system size based on edge function
   const fetchSystemSizing = async (forceSize?: number) => {
+    if (!isMounted.current) return;
     if (!monthlyUsage) {
       console.log('Monthly usage is missing or invalid:', monthlyUsage);
       return;
     }
 
-    console.log('Starting system sizing calculation with usage:', monthlyUsage);
+    // Generate a unique ID for this calculation request
+    const requestId = Date.now().toString();
+    calculationRequestIdRef.current = requestId;
+    
+    console.log(`[${requestId}] Starting system sizing calculation:`, 
+      {usage: monthlyUsage, forceSize, isManual: isManualAdjustment});
+    
     setIsCalculating(true);
     setCalculationError(null);
 
@@ -131,20 +169,33 @@ export default function SizingPage() {
         ...(forceSize ? { forceSize } : {})
       });
 
-      console.log('System sizing calculation completed:', data);
-      setSystemSizing(data);
-      
-      // Only update system size if this isn't a manual adjustment
-      if (!isManualAdjustment && !forceSize) {
-        setSystemSize(data.systemSize);
+      // Check if this is still the most recent request
+      if (!isMounted.current || requestId !== calculationRequestIdRef.current) {
+        console.log(`[${requestId}] Calculation completed but ignored (newer calculation in progress)`);
+        return;
       }
 
-      console.log('Updating system states with:', {
-        systemSize: data.systemSize,
-        weather: data.weather,
-        roofRequirements: data.roofRequirements,
-        batteryRecommendation: data.batteryRecommendation
-      });
+      console.log(`[${requestId}] System sizing calculation completed:`, data);
+      setSystemSizing(data);
+      
+      // Store the recommended system size if not already set
+      if (recommendedSystemSize === null) {
+        console.log(`[${requestId}] Setting recommended system size to:`, data.systemSize);
+        setRecommendedSystemSize(data.systemSize);
+      }
+      
+      // Update system size based on clear rules
+      if (forceSize !== undefined) {
+        console.log(`[${requestId}] Setting system size to forced value:`, forceSize);
+        setSystemSize(forceSize);
+      } else if (!isInitialCalculationComplete && !isManualAdjustment) {
+        console.log(`[${requestId}] Initial calculation - setting system size to:`, data.systemSize);
+        setSystemSize(data.systemSize);
+        setIsInitialCalculationComplete(true);
+      } else {
+        console.log(`[${requestId}] Keeping existing system size:`, systemSize);
+      }
+
       // Update other states as needed
       setWeatherData({
         sunHours: data.weather.sunHours,
@@ -152,7 +203,6 @@ export default function SizingPage() {
         temperatureImpact: data.weather.temperatureImpact,
         annualProduction: data.weather.annualProduction
       });
-      console.log('System size after update:', systemSize);
 
       setRoofRequirements({
         area: data.roof.required_area,
@@ -164,28 +214,51 @@ export default function SizingPage() {
       setBatteryRecommendation(data.battery);
 
     } catch (error: any) {
-      console.error('Failed to calculate system size:', error);
+      if (!isMounted.current || requestId !== calculationRequestIdRef.current) return;
+      console.error(`[${requestId}] Failed to calculate system size:`, error);
       setCalculationError(error?.message || 'Failed to calculate system size');
+    } finally {
+      if (isMounted.current && requestId === calculationRequestIdRef.current) {
+        setIsCalculating(false);
+      }
+    }
+  };
+
+  // Reset to recommended system size
+  const resetToRecommendedSize = async () => {
+    if (recommendedSystemSize === null) return;
+    
+    console.log(`Resetting system size from ${systemSize} to recommended ${recommendedSystemSize}`);
+    setIsManualAdjustment(false);
+    
+    // Trigger edge function recalculation with recommended size
+    try {
+      setIsCalculating(true);
+      await fetchSystemSizing(recommendedSystemSize);
+    } catch (error: any) {
+      setCalculationError(error?.message || 'Failed to update calculations');
     } finally {
       setIsCalculating(false);
     }
   };
 
-
-
   // Adjust system size and recalculate
   const adjustSystemSize = async (increment: boolean) => {
     const newSize = increment ? 
       Math.min(systemSize + 0.5, 15) : // Max 15kW
-      Math.max(systemSize - 0.5, 1);    // Min 1kW
+      Math.max(systemSize - 0.5, 1);   // Min 1kW
     
-    setIsManualAdjustment(true); // Mark this as a manual adjustment
+    if (newSize === systemSize) return; // No change needed
+    
+    console.log(`Manually adjusting system size from ${systemSize} to ${newSize}`);
+    
+    setIsManualAdjustment(true);
     setSystemSize(newSize);
     
     // Trigger edge function recalculation with updated size
     try {
       setIsCalculating(true);
-      await fetchSystemSizing(newSize); // Use the main function with forceSize
+      await fetchSystemSizing(newSize); // Pass the new size explicitly
     } catch (error: any) {
       setCalculationError(error?.message || 'Failed to update calculations');
     } finally {
@@ -216,7 +289,11 @@ export default function SizingPage() {
 
       if (result) {
         setQuoteSaved(true);
-        setTimeout(() => setQuoteSaved(false), 3000);
+        setTimeout(() => {
+          if (isMounted.current) {
+            setQuoteSaved(false);
+          }
+        }, 3000);
       } else {
         throw new Error("Failed to save quote");
       }
@@ -224,102 +301,222 @@ export default function SizingPage() {
       console.error('Error saving quote:', (err as Error).message);
       setError("Failed to save your quote. Please try again.");
     } finally {
-      setSavingQuote(false);
+      if (isMounted.current) {
+        setSavingQuote(false);
+      }
+    }
+  };
+
+  // Fetch equipment data with retries and fallbacks
+  const fetchEquipmentData = async (retryCount = 0) => {
+    console.log(`Attempting to fetch equipment data (attempt ${retryCount + 1})...`);
+    
+    try {
+      // Try to fetch all equipment in parallel
+      const { panels: fetchedPanels, inverters: fetchedInverters, 
+              structureTypes: fetchedStructureTypes, 
+              bracketCosts: fetchedBracketCosts, 
+              variableCosts: fetchedVariableCosts } = await fetchAllEquipment();
+      
+      // Check if we got valid data for each type
+      const hasValidPanels = fetchedPanels && fetchedPanels.length > 0;
+      const hasValidInverters = fetchedInverters && fetchedInverters.length > 0;
+      const hasValidStructureTypes = fetchedStructureTypes && fetchedStructureTypes.length > 0;
+      const hasValidBracketCosts = fetchedBracketCosts && fetchedBracketCosts.length > 0;
+      const hasValidVariableCosts = fetchedVariableCosts && fetchedVariableCosts.length > 0;
+      
+      // Use fetched data or fallbacks
+      if (hasValidPanels) {
+        console.log(`Setting ${fetchedPanels.length} panels from database`);
+        setPanels(fetchedPanels);
+      } else {
+        console.warn('No panels found in database, using defaults');
+        setPanels(DEFAULT_EQUIPMENT.panels);
+      }
+      
+      if (hasValidInverters) {
+        console.log(`Setting ${fetchedInverters.length} inverters from database`);
+        setInverters(fetchedInverters);
+      } else {
+        console.warn('No inverters found in database, using defaults');
+        setInverters(DEFAULT_EQUIPMENT.inverters);
+      }
+      
+      if (hasValidStructureTypes) {
+        console.log(`Setting ${fetchedStructureTypes.length} structure types from database`);
+        setStructureTypes(fetchedStructureTypes);
+      } else {
+        console.warn('No structure types found in database, using defaults');
+        setStructureTypes(DEFAULT_EQUIPMENT.structureTypes);
+      }
+      
+      if (hasValidBracketCosts) {
+        console.log(`Setting ${fetchedBracketCosts.length} bracket costs from database`);
+        setBracketCosts(fetchedBracketCosts);
+      } else {
+        console.warn('No bracket costs found in database, using defaults');
+        setBracketCosts(DEFAULT_EQUIPMENT.bracketCosts);
+      }
+      
+      if (hasValidVariableCosts) {
+        console.log(`Setting ${fetchedVariableCosts.length} variable costs from database`);
+        setVariableCosts(fetchedVariableCosts);
+      } else {
+        console.warn('No variable costs found in database, using defaults');
+        setVariableCosts(DEFAULT_EQUIPMENT.variableCosts);
+      }
+      
+      // Set default selections
+      const defaultPanel = hasValidPanels ? 
+        fetchedPanels.find(p => p.default_choice) || fetchedPanels[0] : 
+        DEFAULT_EQUIPMENT.panels[0];
+      
+      setSelectedPanelType(defaultPanel.id);
+      
+      return true;
+    } catch (err) {
+      console.error('Error fetching equipment data:', err);
+      
+      // Retry logic for transient errors
+      if (retryCount < 2) {
+        console.log(`Retrying equipment fetch (attempt ${retryCount + 2})...`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+        return fetchEquipmentData(retryCount + 1);
+      }
+      
+      // If all retries fail, use defaults
+      console.warn('All equipment fetch attempts failed, using defaults');
+      setPanels(DEFAULT_EQUIPMENT.panels);
+      setInverters(DEFAULT_EQUIPMENT.inverters);
+      setStructureTypes(DEFAULT_EQUIPMENT.structureTypes);
+      setBracketCosts(DEFAULT_EQUIPMENT.bracketCosts);
+      setVariableCosts(DEFAULT_EQUIPMENT.variableCosts);
+      
+      // Set default selections
+      setSelectedPanelType(DEFAULT_EQUIPMENT.panels[0].id);
+      
+      setFetchError('Could not fetch equipment data from database. Using default values.');
+      return false;
+    }
+  };
+
+  // Fetch bill data from database
+  const fetchBillData = async () => {
+    console.log('Fetching bill data...');
+    const storedBillRef = localStorage.getItem('billReference');
+    
+    if (!storedBillRef) {
+      console.log('No bill reference found in localStorage');
+      return null;
+    }
+    
+    console.log('Fetching bill with reference:', storedBillRef);
+    setBillReference(storedBillRef);
+    
+    try {
+      const billRecord = await fetchBillByReference(storedBillRef);
+      
+      if (!billRecord) {
+        console.warn('No bill found with reference:', storedBillRef);
+        return null;
+      }
+      
+      console.log('Successfully fetched bill data:', billRecord);
+      return billRecord;
+    } catch (err) {
+      console.error('Error fetching bill:', err);
+      return null;
     }
   };
 
   // Fetch data on component mount
   useEffect(() => {
-    const fetchData = async () => {
+    const initializeApp = async () => {
+      if (equipmentFetchAttemptedRef.current) return;
+      equipmentFetchAttemptedRef.current = true;
+      
       try {
         setLoading(true);
+        console.log('Initializing application data...');
 
-        // Get bill reference from localStorage
-        const storedBillRef = localStorage.getItem('billReference');
-        setBillReference(storedBillRef);
-
-        // Get bill data if available
-        if (storedBillRef) {
-          const billRecord = await fetchBillByReference(storedBillRef);
-
-          if (billRecord) {
-            setBillId(billRecord.id);
-
-            // Set monthly usage based on bill data
-            setMonthlyUsage(billRecord.units_consumed);
-
-            // Calculate appropriate system size based on usage
-            // A rough estimation: 1 kW system produces about 120 kWh per month
-            const calculatedSize = Math.ceil(billRecord.units_consumed / 120 * 10) / 10; // Round to nearest 0.1
-            setSystemSize(calculatedSize);
+        // Step 1: Fetch equipment data
+        const equipmentSuccess = await fetchEquipmentData();
+        
+        // Step 2: Fetch bill data if available
+        const billRecord = await fetchBillData();
+        
+        if (billRecord && isMounted.current) {
+          setBillId(billRecord.id);
+          
+          // Calculate system size from consumption
+          const unitsConsumed = billRecord.units_consumed;
+          const calculatedSize = Math.ceil(unitsConsumed / 120 * 10) / 10; // Round to nearest 0.1
+          
+          // IMPORTANT: Set size first, then usage to avoid duplicate calculations
+          console.log('Setting initial system size to:', calculatedSize);
+          setSystemSize(calculatedSize);
+          
+          // Update inverter selection based on system size
+          if (inverters.length > 0) {
+            const appropriateInverter = inverters.find(inv => inv.power >= calculatedSize) || inverters[0];
+            console.log(`Setting inverter to ${appropriateInverter.brand} (${appropriateInverter.power}kW) for ${calculatedSize}kW system`);
+            setSelectedInverterType(appropriateInverter.id);
           }
+          
+          // Set monthly usage last to trigger calculation
+          console.log('Setting monthly usage from bill:', unitsConsumed);
+          setMonthlyUsage(unitsConsumed);
+        } else {
+          // No bill data, use default values
+          console.log('No bill data found, using default values');
+          setMonthlyUsage(856);
         }
-
-        // Mock equipment data for testing
-        const panelsData: Panel[] = [
-          { id: "1", brand: "JinkoSolar", power: 450, price: 45000, default_choice: true },
-          { id: "2", brand: "LONGi", power: 545, price: 58000, default_choice: false },
-          { id: "3", brand: "JA Solar", power: 800, price: 85000, default_choice: false }
-        ];
-
-        const invertersData: Inverter[] = [
-          { id: "1", brand: "Sungrow", power: 5, price: 120000 },
-          { id: "2", brand: "Huawei", power: 10, price: 180000 },
-          { id: "3", brand: "SMA", power: 15, price: 250000 }
-        ];
-
-        const structureTypesData: StructureType[] = [
-          { id: "1", l2: true, custom_cost: 8000, abs_cost: 5000 }
-        ];
-
-        const bracketCostsData: BracketCost[] = [
-          { id: "1", min_size: 1, max_size: 5, dc_cable: 300, ac_cable: 400, accessories: 8000 }
-        ];
-
-        const variableCostsData: VariableCost[] = [
-          { id: "1", cost_name: "installation", cost: 25000 },
-          { id: "2", cost_name: "transport", cost: 15000 }
-        ];
-
-        setPanels(panelsData);
-        setInverters(invertersData);
-        setStructureTypes(structureTypesData);
-        setBracketCosts(bracketCostsData);
-        setVariableCosts(variableCostsData);
-
-        // Set default panel
-        const defaultPanel = panelsData.find(p => p.default_choice) || panelsData[0];
-        if (defaultPanel) {
-          setSelectedPanelType(defaultPanel.id);
-        }
-
-        // Set default inverter - choose one appropriate for system size
-        const appropriateInverter = invertersData.find(inv => inv.power >= systemSize) || invertersData[0];
-        if (appropriateInverter) {
-          setSelectedInverterType(appropriateInverter.id);
-        }
-
-        setLoading(false);
+        
+        setIsInitialLoadComplete(true);
       } catch (err: any) {
-        console.error('Error fetching data:', err);
-        setError(err.message || 'Failed to load data. Please try again.');
-        setLoading(false);
+        console.error('Error during initialization:', err);
+        if (isMounted.current) {
+          setError(err.message || 'Failed to initialize application. Please try again.');
+        }
+      } finally {
+        if (isMounted.current) {
+          setLoading(false);
+        }
       }
     };
 
-    fetchData();
+    initializeApp();
+
+    // Cleanup function to prevent state updates after unmount
+    return () => {
+      console.log('Component unmounting, cleaning up');
+      isMounted.current = false;
+    };
   }, []);
 
-  // Calculate system size when monthly usage changes
+  // Trigger system sizing calculation when monthly usage is set and initial load is complete
   useEffect(() => {
-    console.log('Monthly usage changed, calculating system size:', monthlyUsage);
-    setIsManualAdjustment(false); // Reset manual adjustment when usage changes
-    fetchSystemSizing();
-  }, [monthlyUsage]);
+    if (monthlyUsage && isInitialLoadComplete && !isInitialCalculationComplete && isMounted.current) {
+      console.log('Initial calculation triggered by monthlyUsage:', monthlyUsage);
+      fetchSystemSizing();
+    }
+  }, [monthlyUsage, isInitialLoadComplete, isInitialCalculationComplete]);
+
+  // Update inverter selection based on system size changes
+  useEffect(() => {
+    if (!inverters.length || !isMounted.current) return;
+    
+    const appropriateInverter = inverters.find(inv => inv.power >= systemSize) || inverters[0];
+    if (appropriateInverter && appropriateInverter.id !== selectedInverterType) {
+      console.log(`Updating inverter selection to ${appropriateInverter.brand} (${appropriateInverter.power}kW) for ${systemSize}kW system`);
+      setSelectedInverterType(appropriateInverter.id);
+    }
+  }, [systemSize, inverters, isInitialCalculationComplete]);
 
   // Update quote data when system sizing data changes
   useEffect(() => {
-    if (systemSizing?.costs) {
+    if (systemSizing?.costs && isMounted.current) {
+      console.log('Updating quote breakdown based on system sizing data');
       setQuoteTotal(systemSizing.costs.total);
       setQuoteBreakdown({
         panels: systemSizing.costs.panels,
@@ -430,6 +627,19 @@ export default function SizingPage() {
           </div>
         </header>
 
+        {/* Database fetch error warning */}
+        {fetchError && (
+          <div className="mb-6 bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-500 mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="text-amber-800 text-sm">{fetchError}</p>
+              <p className="text-xs text-amber-700 mt-1">
+                The quote will still work correctly with default values, but you may want to check your database connection.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Hero Section */}
         <div className="relative mb-8 md:mb-10 bg-gradient-to-r from-emerald-500 to-emerald-700 rounded-2xl overflow-hidden shadow-xl">
           <div className="absolute inset-0 bg-black/10"></div>
@@ -438,7 +648,7 @@ export default function SizingPage() {
               <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-white mb-3 md:mb-4">
                 Your Perfect Solar Solution
               </h1>
-              <p className="text-emerald-50 mb-4 md:mb-6 text-base md:text-lg">
+              <p className="text-emerald-50 mb-6 md:mb-8 text-base md:text-lg">
                 Customized system sizing based on your energy profile and location data.
               </p>
               <div className="flex gap-3 md:gap-4">
@@ -461,7 +671,14 @@ export default function SizingPage() {
               <div className="absolute inset-0 bg-gradient-to-br from-emerald-400/20 to-emerald-700/20 rounded-full animate-pulse"></div>
               <div className="absolute inset-4 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center">
                 <div className="text-center">
-                  <div className="text-3xl md:text-5xl font-bold text-white mb-1 md:mb-2">{systemSize}</div>
+                  <div className="text-3xl md:text-5xl font-bold text-white mb-1 md:mb-2">
+                    {systemSize}
+                    {isCalculating && (
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      </div>
+                    )}
+                  </div>
                   <div className="text-sm md:text-base text-emerald-100">kW System</div>
                 </div>
               </div>
@@ -497,6 +714,21 @@ export default function SizingPage() {
           </p>
         </div>
 
+        {/* Calculation error display */}
+        {calculationError && (
+          <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="text-red-800 text-sm">{calculationError}</p>
+              <button 
+                onClick={() => window.location.reload()}
+                className="text-xs text-red-700 underline mt-1">
+                Refresh the page
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Quote Total Summary Card */}
         <div className="bg-white rounded-2xl p-6 shadow-xl border border-gray-100 mb-6 md:mb-8">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
@@ -508,7 +740,13 @@ export default function SizingPage() {
             </div>
             <div className="text-center md:text-right">
               <div className="text-3xl md:text-4xl font-bold text-emerald-600">
-                {quoteTotal ? formatCurrency(quoteTotal) : "Calculating..."}
+                {isCalculating ? (
+                  <span className="text-emerald-400">Calculating...</span>
+                ) : quoteTotal ? (
+                  formatCurrency(quoteTotal)
+                ) : (
+                  "Calculating..."
+                )}
               </div>
               <div className="text-sm text-gray-500">Estimated savings of {formatCurrency(quoteTotal ? quoteTotal * 1.5 : 0)} over 25 years</div>
             </div>
@@ -533,7 +771,7 @@ export default function SizingPage() {
                 </div>
               </div>
               <div className="text-4xl md:text-5xl font-bold mb-4 text-gray-900 flex items-end gap-2">
-                {monthlyUsage} <span className="text-lg md:text-xl text-gray-500 font-normal">kWh</span>
+                {monthlyUsage || '...'} <span className="text-lg md:text-xl text-gray-500 font-normal">kWh</span>
               </div>
               <div className="space-y-3 mb-6">
                 <div className="flex justify-between items-center">
@@ -541,19 +779,19 @@ export default function SizingPage() {
                     <div className="w-3 h-3 rounded-full bg-emerald-500 mr-2"></div>
                     <span className="text-sm">Peak Hours</span>
                   </div>
-                  <span className="text-sm font-medium">{Math.round(monthlyUsage * 0.42)} kWh</span>
+                  <span className="text-sm font-medium">{monthlyUsage ? Math.round(monthlyUsage * 0.42) : '...'} kWh</span>
                 </div>
                 <div className="flex justify-between items-center">
                   <div className="flex items-center">
                     <div className="w-3 h-3 rounded-full bg-gray-800 mr-2"></div>
                     <span className="text-sm">Off-Peak</span>
                   </div>
-                  <span className="text-sm font-medium">{Math.round(monthlyUsage * 0.58)} kWh</span>
+                  <span className="text-sm font-medium">{monthlyUsage ? Math.round(monthlyUsage * 0.58) : '...'} kWh</span>
                 </div>
               </div>
               <div className="bg-emerald-50 p-3 rounded-lg">
                 <div className="text-sm text-emerald-700">
-                  <span className="font-medium">Solar Production:</span> {systemSizing?.production?.monthly} kWh/month
+                  <span className="font-medium">Solar Production:</span> {systemSizing?.production?.monthly || '...'} kWh/month
                 </div>
               </div>
             </div>
@@ -570,28 +808,39 @@ export default function SizingPage() {
                   </div>
                   <div className="font-semibold text-gray-800">System Size</div>
                 </div>
-                <div className="text-gray-400 group-hover:text-emerald-500 transition-colors">
-                  <ChevronRight className="w-5 h-5" />
-                </div>
+                {isManualAdjustment && recommendedSystemSize !== null && (
+                  <button 
+                    onClick={resetToRecommendedSize} 
+                    className="text-xs text-emerald-600 flex items-center gap-1 border border-emerald-200 rounded-lg px-2 py-1 hover:bg-emerald-50 transition-colors"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Reset</span>
+                  </button>
+                )}
               </div>
 
               <div className="flex items-center justify-between mb-6">
                 <button
                   onClick={() => adjustSystemSize(false)}
-                  className="bg-gray-100 p-2 rounded-full hover:bg-gray-200 transition-colors"
-                  disabled={systemSize <= 1}
+                  className="bg-gray-100 p-2 rounded-full hover:bg-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={systemSize <= 1 || isCalculating}
                 >
                   <Minus className="w-5 h-5 text-gray-700" />
                 </button>
 
                 <div className="text-4xl md:text-5xl font-bold text-gray-900">
                   {systemSize} <span className="text-lg md:text-xl text-gray-500 font-normal">kW</span>
+                  {isCalculating && (
+                    <div className="text-sm text-emerald-500 animate-pulse mt-1 text-center">
+                      Calculating...
+                    </div>
+                  )}
                 </div>
 
                 <button
                   onClick={() => adjustSystemSize(true)}
-                  className="bg-gray-100 p-2 rounded-full hover:bg-gray-200 transition-colors"
-                  disabled={systemSize >= 15}
+                  className="bg-gray-100 p-2 rounded-full hover:bg-gray-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={systemSize >= 15 || isCalculating}
                 >
                   <Plus className="w-5 h-5 text-gray-700" />
                 </button>
@@ -609,8 +858,12 @@ export default function SizingPage() {
                     <div className="absolute top-1/2 left-[60%] -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-white border-2 border-emerald-500 rounded-full shadow-md"></div>
                   </div>
                   <div className="flex justify-between text-xs text-gray-500">
-                    <span>5.0 kW</span>
-                    <span>10.0 kW</span>
+                    <span>
+                      {systemSizing?.recommendedRange?.minimum?.toFixed(1) || '5.0'} kW
+                    </span>
+                    <span>
+                      {systemSizing?.recommendedRange?.maximum?.toFixed(1) || '10.0'} kW
+                    </span>
                   </div>
                 </div>
 
@@ -650,19 +903,19 @@ export default function SizingPage() {
               <div className="flex justify-between mb-4 md:mb-6">
                 <div className="text-center">
                   <div className="text-3xl md:text-4xl font-bold text-gray-900">
-                    {systemSizing?.efficiencyFactors?.irradiance?.toFixed(1)}
+                    {systemSizing?.efficiencyFactors?.irradiance?.toFixed(1) || '...'}
                   </div>
                   <div className="text-sm text-gray-500">Irradiance</div>
                 </div>
                 <div className="text-center">
                   <div className="text-3xl md:text-4xl font-bold text-gray-900">
-                    {systemSizing?.efficiencyFactors?.inverter}%
+                    {systemSizing?.efficiencyFactors?.inverter || '...'}%
                   </div>
                   <div className="text-sm text-gray-500">Inverter Efficiency</div>
                 </div>
                 <div className="text-center">
                   <div className="text-3xl md:text-4xl font-bold text-gray-900">
-                    {systemSizing?.efficiencyFactors?.temperature}%
+                    {systemSizing?.efficiencyFactors?.temperature || '...'}%
                   </div>
                   <div className="text-sm text-gray-500">Temp Impact</div>
                 </div>
@@ -672,7 +925,7 @@ export default function SizingPage() {
                 <div className="bg-gray-50 p-2 md:p-3 rounded-lg text-center">
                   <Cloud className="w-4 h-4 md:w-5 md:h-5 text-gray-400 mx-auto mb-1" />
                   <div className="text-xs text-gray-500">Cloud Cover</div>
-                  <div className="text-xs md:text-sm font-medium">{systemSizing?.weather?.cloudCover}%</div>
+                  <div className="text-xs md:text-sm font-medium">{systemSizing?.weather?.cloudCover || '10'}%</div>
                 </div>
                 <div className="bg-gray-50 p-2 md:p-3 rounded-lg text-center">
                   <ThermometerSun className="w-4 h-4 md:w-5 md:h-5 text-orange-400 mx-auto mb-1" />
@@ -688,8 +941,8 @@ export default function SizingPage() {
 
               <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-100">
                 <div className="text-sm font-medium text-emerald-800 mb-2">Annual Production</div>
-                <div className="text-xl md:text-2xl font-bold text-emerald-700">{systemSizing?.production?.annual} kWh</div>
-                <div className="text-xs text-emerald-600 mt-1">{systemSizing?.weather?.sunHours} peak sun hours/day</div>
+                <div className="text-xl md:text-2xl font-bold text-emerald-700">{systemSizing?.production?.annual || '...'} kWh</div>
+                <div className="text-xs text-emerald-600 mt-1">{systemSizing?.weather?.sunHours || '...'} peak sun hours/day</div>
               </div>
             </div>
           </div>
@@ -1066,7 +1319,7 @@ export default function SizingPage() {
                     <div>
                     <div className="text-sm font-medium text-emerald-800 mb-1">Battery System</div>
                     <div className="text-sm text-emerald-700">
-                      {batteryRecommendation?.recommended_capacity}kWh capacity ({batteryRecommendation?.autonomy_days} day autonomy)
+                      {batteryRecommendation?.recommended_capacity?.toFixed(1) || '...'} kWh capacity ({batteryRecommendation?.autonomy_days || '...'} day autonomy)
                       {batteryRecommendation?.efficiency_rating && ` • ${batteryRecommendation.efficiency_rating * 100}% efficiency`}
                     </div>
                     </div>
